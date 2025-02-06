@@ -87,8 +87,6 @@ async def async_setup_entry(
         # Loop through all resources and create sensors
         for resource in resources:
             if resource.classifier in ["electricity.consumption", "gas.consumption"]:
-                # usage_sensor = Usage(hass, resource, virtual_entity)
-                # entities.append(usage_sensor)
                 historical_usage_sensor = HistoricalUsage(
                     hass, resource, virtual_entity
                 )
@@ -104,16 +102,10 @@ async def async_setup_entry(
         # Cost sensors must be created after usage sensors as they reference them as a meter
         for resource in resources:
             if resource.classifier == "gas.consumption.cost":
-                # cost_sensor = Cost(hass, resource, virtual_entity)
-                # cost_sensor.meter = meters["gas.consumption"]
-                # entities.append(cost_sensor)
                 historical_cost_sensor = HistoricalCost(hass, resource, virtual_entity)
                 historical_cost_sensor.meter = meters["gas.consumption"]
                 entities.append(historical_cost_sensor)
             elif resource.classifier == "electricity.consumption.cost":
-                # cost_sensor = Cost(hass, resource, virtual_entity)
-                # cost_sensor.meter = meters["electricity.consumption"]
-                # entities.append(cost_sensor)
                 historical_cost_sensor = HistoricalCost(hass, resource, virtual_entity)
                 historical_cost_sensor.meter = meters["electricity.consumption"]
                 entities.append(historical_cost_sensor)
@@ -155,19 +147,16 @@ async def daily_data(
     hass: HomeAssistant, resource, t_from: datetime = None
 ) -> (float, str):
     """Get daily usage from the API."""
-    is_init = True
     if t_from is None:
-        is_init = False
         t_from = await hass.async_add_executor_job(
-            resource.round, datetime.now().replace(hour=0, minute=0, second=0), "P1D"
+            resource.round, datetime.now() - timedelta(hours=12), "P1D"
         )
 
-    delta_hrs = (datetime.now() - timedelta(hours=1)).replace(minute=59, second=59)
-    if is_init:
-        delta_hrs = (datetime.now() - timedelta(days=1)).replace(
-            hour=23, minute=59, second=59
-        )
-    t_to = await hass.async_add_executor_job(resource.round, delta_hrs, "PT1M")
+    t_to = await hass.async_add_executor_job(
+        resource.round,
+        (datetime.now() - timedelta(hours=3)).replace(minute=59, second=59),
+        "PT1M",
+    )
     try:
         await hass.async_add_executor_job(resource.catchup)
         _LOGGER.debug(
@@ -188,14 +177,8 @@ async def daily_data(
 
     try:
         # difference in days between t_from and t_to
-        diffDays = (t_to - t_from).days
-
-        period = "PT30M"
-        if diffDays > 9:
-            period = "PT1H"
-
         readings = await hass.async_add_executor_job(
-            resource.get_readings, t_from, t_to, period, "sum", True
+            resource.get_readings, t_from, t_to, "PT1H", "sum", True
         )
         _LOGGER.debug("Successfully got daily usage for resource id %s", resource.id)
         return readings
@@ -251,7 +234,6 @@ class HistoricalSensorMixin(PollUpdateMixin, HistoricalSensor, SensorEntity):
     def get_statistic_metadata(self) -> StatisticMetaData:
         meta = super().get_statistic_metadata()
         meta["has_sum"] = True
-        meta["has_mean"] = True
         return meta
 
     async def async_calculate_statistic_data(
@@ -284,46 +266,6 @@ class HistoricalSensorMixin(PollUpdateMixin, HistoricalSensor, SensorEntity):
                 )
             )
         return ret
-
-
-class Usage(SensorEntity):
-    """Sensor object for daily usage."""
-
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_has_entity_name = True
-    _attr_name = "Usage (today)"
-    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
-        """Initialize the sensor."""
-        self._attr_unique_id = resource.id
-        self.hass = hass
-        self.initialised = False
-        self.resource = resource
-        self.virtual_entity = virtual_entity
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.resource.id)},
-            manufacturer="Hildebrand",
-            model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
-        )
-
-    @property
-    def icon(self) -> str | None:
-        """Icon to use in the frontend."""
-        if self.resource.classifier == "gas.consumption":
-            return "mdi:fire"
-
-    async def async_update(self) -> None:
-        """Fetch new data for the sensor."""
-        if not self.initialised or await should_update():
-            readings = await daily_data(self.hass, self.resource)
-            self._attr_native_value = round(sum([r[1].value for r in readings]), 2)
-            self.initialised = True
 
 
 class HistoricalUsage(HistoricalSensorMixin):
@@ -375,43 +317,6 @@ class HistoricalUsage(HistoricalSensorMixin):
                     )
                 )
             self._attr_historical_states = hist_states
-
-
-class Cost(SensorEntity):
-    """Sensor usage for daily cost."""
-
-    _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_has_entity_name = True
-    _attr_name = "Cost (today)"
-    _attr_native_unit_of_measurement = "GBP"
-
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
-        """Initialize the sensor."""
-        self._attr_unique_id = resource.id
-        self.hass = hass
-        self.initialised = False
-        self.meter = None
-        self.resource = resource
-        self.virtual_entity = virtual_entity
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.meter.resource.id)},
-            manufacturer="Hildebrand",
-            model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
-        )
-
-    async def async_update(self) -> None:
-        """Fetch new data for the sensor."""
-        if not self.initialised or await should_update():
-            readings = await daily_data(self.hass, self.resource)
-            self._attr_native_value = round(
-                sum([r[1].value for r in readings]) / 100, 2
-            )
-            self.initialised = True
 
 
 class HistoricalCost(HistoricalSensorMixin):
