@@ -193,6 +193,7 @@ async def daily_data(
         _LOGGER.debug("Successfully got daily usage for resource id %s", resource.id)
         # Last reading may not be complete, so discard.
         filtered_readings = discard_after_last_non_zero_reading(readings)
+        _LOGGER.debug("Readings for resource id %s: %s",resource.id,len(filtered_readings))
         return filtered_readings
     except requests.Timeout as ex:
         _LOGGER.error("Timeout: %s", ex)
