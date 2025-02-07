@@ -143,6 +143,16 @@ async def should_update() -> bool:
     return False
 
 
+def discard_after_last_non_zero_reading(readings):
+    # Iterate through the readings in reverse order
+    for i in range(len(readings) - 1, -1, -1):
+        if readings[i][1].value != 0:
+            # Slice the list to exclude the last non-zero reading
+            return readings[:i]
+    # If all readings are zero, return an empty list
+    return []
+
+
 async def daily_data(
     hass: HomeAssistant, resource, t_from: datetime = None
 ) -> (float, str):
@@ -154,7 +164,7 @@ async def daily_data(
 
     t_to = await hass.async_add_executor_job(
         resource.round,
-        (datetime.now() - timedelta(hours=3)).replace(minute=59, second=59),
+        (datetime.now() - timedelta(hours=1)).replace(minute=59, second=59),
         "PT1M",
     )
     try:
@@ -181,7 +191,9 @@ async def daily_data(
             resource.get_readings, t_from, t_to, "PT1H", "sum", True
         )
         _LOGGER.debug("Successfully got daily usage for resource id %s", resource.id)
-        return readings
+        # Last reading may not be complete, so discard.
+        filtered_readings = discard_after_last_non_zero_reading(readings)
+        return filtered_readings
     except requests.Timeout as ex:
         _LOGGER.error("Timeout: %s", ex)
     except requests.exceptions.ConnectionError as ex:
