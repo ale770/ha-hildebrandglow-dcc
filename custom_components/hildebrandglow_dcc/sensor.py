@@ -4,18 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta
-import itertools
 import logging
-import statistics
 
-from homeassistant_historical_sensor import (
-    HistoricalSensor,
-    HistoricalState,
-    PollUpdateMixin,
-)
 import requests
 
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import async_add_external_statistics
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
@@ -26,21 +20,20 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.event import async_track_time_change
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(minutes=5)
-
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: Callable
 ) -> bool:
     """Set up the sensor platform."""
-    entities: list = []
-    meters: dict = {}
+    entities: list[SensorEntity] = []
+    meters: dict[str, SensorEntity] = {}
 
-    # Get API object from the config flow
+    # Get API object from the config flow.
     glowmarkt = hass.data[DOMAIN][entry.entry_id]
 
     # Gather all virtual entities on the account
@@ -87,11 +80,17 @@ async def async_setup_entry(
         # Loop through all resources and create sensors
         for resource in resources:
             if resource.classifier in ["electricity.consumption", "gas.consumption"]:
-                historical_usage_sensor = HistoricalUsage(
-                    hass, resource, virtual_entity
+                usage_sensor = HistoricalUsageSensor(hass, virtual_entity, resource)
+                entities.append(usage_sensor)
+                meters[resource.classifier] = usage_sensor
+
+                # Schedule the sensor to update every day at 12:00 PM.
+                async_track_time_change(
+                    hass,
+                    usage_sensor.async_update_callback,
+                    minute=[1, 31],
+                    second=0,
                 )
-                entities.append(historical_usage_sensor)
-                meters[resource.classifier] = historical_usage_sensor
 
                 coordinator = TariffCoordinator(hass, resource)
                 standing_sensor = Standing(coordinator, resource, virtual_entity)
@@ -99,24 +98,44 @@ async def async_setup_entry(
                 rate_sensor = Rate(coordinator, resource, virtual_entity)
                 entities.append(rate_sensor)
 
+                async_track_time_change(
+                    hass,
+                    lambda now: coordinator.async_request_refresh(),
+                    minute=[1, 31],
+                    second=0,
+                )
+
         # Cost sensors must be created after usage sensors as they reference them as a meter
         for resource in resources:
             if resource.classifier == "gas.consumption.cost":
-                historical_cost_sensor = HistoricalCost(hass, resource, virtual_entity)
-                historical_cost_sensor.meter = meters["gas.consumption"]
-                entities.append(historical_cost_sensor)
+                cost_sensor = HistoricalCostSensor(hass, virtual_entity, resource)
+                cost_sensor.meter = meters.get("gas.consumption")
+                entities.append(cost_sensor)
+
+                async_track_time_change(
+                    hass,
+                    cost_sensor.async_update_callback,
+                    minute=[1, 31],
+                    second=0,
+                )
             elif resource.classifier == "electricity.consumption.cost":
-                historical_cost_sensor = HistoricalCost(hass, resource, virtual_entity)
-                historical_cost_sensor.meter = meters["electricity.consumption"]
-                entities.append(historical_cost_sensor)
+                cost_sensor = HistoricalCostSensor(hass, virtual_entity, resource)
+                cost_sensor.meter = meters.get("electricity.consumption")
+                entities.append(cost_sensor)
+
+                async_track_time_change(
+                    hass,
+                    cost_sensor.async_update_callback,
+                    minute=[1, 31],
+                    second=0,
+                )
 
     async_add_entities(entities, update_before_add=True)
-
     return True
 
 
 def supply_type(resource) -> str:
-    """Return supply type."""
+    """Return the supply type based on resource classifier."""
     if "electricity.consumption" in resource.classifier:
         return "electricity"
     if "gas.consumption" in resource.classifier:
@@ -126,37 +145,23 @@ def supply_type(resource) -> str:
 
 
 def device_name(resource, virtual_entity) -> str:
-    """Return device name. Includes name of virtual entity if it exists."""
+    """Return a device name based on the resource and virtual entity."""
     supply = supply_type(resource)
-    if virtual_entity.name is not None:
-        name = f"{virtual_entity.name} smart {supply} meter"
-    else:
-        name = f"Smart {supply} meter"
-    return name
+    if virtual_entity.name:
+        return f"{virtual_entity.name} Smart {supply.capitalize()} Meter"
+    return f"Smart {supply.capitalize()} Meter"
 
 
 async def should_update() -> bool:
-    """Check if time is between 0-5 or 30-35 minutes past the hour."""
+    """Return True if current minute is between 1-5 or 31-35, indicating an update window."""
     minutes = datetime.now().minute
-    if (1 <= minutes <= 5) or (31 <= minutes <= 35):
-        return True
-    return False
-
-
-def discard_after_last_non_zero_reading(readings):
-    # Iterate through the readings in reverse order
-    for i in range(len(readings) - 1, -1, -1):
-        if readings[i][1].value != 0:
-            # Slice the list to exclude the last non-zero reading
-            return readings[:i]
-    # If all readings are zero, return an empty list
-    return []
+    return (1 <= minutes <= 5) or (31 <= minutes <= 35)
 
 
 async def daily_data(
     hass: HomeAssistant, resource, t_from: datetime = None
-) -> (float, str):
-    """Get daily usage from the API."""
+) -> list[tuple[datetime, float]] | None:
+    """Return hourly readings for a daily period from the API."""
     if t_from is None:
         t_from = await hass.async_add_executor_job(
             resource.round, datetime.now() - timedelta(hours=12), "P1D"
@@ -169,256 +174,306 @@ async def daily_data(
     )
     try:
         await hass.async_add_executor_job(resource.catchup)
-        _LOGGER.debug(
-            "Successful GET to https://api.glowmarkt.com/api/v0-1/resource/%s/catchup",
-            resource.id,
-        )
+        _LOGGER.debug("Successful GET to /resource/%s/catchup", resource.id)
     except requests.Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
+        _LOGGER.error("Timeout during catchup for resource %s: %s", resource.id, ex)
     except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.error(
+            "Cannot connect during catchup for resource %s: %s", resource.id, ex
+        )
+    except Exception as ex:
         if "Request failed" in str(ex):
             _LOGGER.warning(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
+                "Non-200 Status Code during catchup for resource %s; the API may be having issues",
+                resource.id,
             )
         else:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+            _LOGGER.exception(
+                "Unexpected exception during catchup for resource %s: %s. Please open an issue",
+                resource.id,
+                ex,
+            )
 
     try:
-        # difference in days between t_from and t_to
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "PT1H", "sum", True
         )
-        _LOGGER.debug("Successfully got daily usage for resource id %s", resource.id)
-        # Last reading may not be complete, so discard.
-        filtered_readings = discard_after_last_non_zero_reading(readings)
-        _LOGGER.debug("Readings for resource id %s: %s",resource.id,len(filtered_readings))
-        return filtered_readings
+        _LOGGER.debug("Successfully got hourly readings for resource %s", resource.id)
+        return readings
     except requests.Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
+        _LOGGER.error("Timeout fetching readings for resource %s: %s", resource.id, ex)
     except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.error(
+            "Cannot connect fetching readings for resource %s: %s", resource.id, ex
+        )
+    except Exception as ex:
         if "Request failed" in str(ex):
             _LOGGER.warning(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
+                "Non-200 Status Code when fetching readings for resource %s",
+                resource.id,
             )
         else:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+            _LOGGER.exception(
+                "Unexpected exception fetching readings for resource %s: %s. Please open an issue",
+                resource.id,
+                ex,
+            )
     return None
 
 
-async def tariff_data(hass: HomeAssistant, resource) -> float:
+def _generate_statistics_from_readings(
+    readings: list[tuple[datetime, float]],
+    isPence: bool = False,
+) -> list[StatisticData]:
+    """Convert a list of (datetime, value) readings into StatisticData entries."""
+    sorted_readings = sorted(readings, key=lambda x: x[0])
+    cumulative = 0.0
+    stats: list[StatisticData] = []
+    for dt_obj, elem in sorted_readings:
+        hour_ts = dt_obj.replace(minute=0, second=0, microsecond=0)
+        value = elem.value
+        if isPence:
+            value = elem.value / 100
+        cumulative += value
+        stats.append(
+            StatisticData(
+                start=dt_util.as_utc(hour_ts),
+                state=value,
+                sum=cumulative,
+            )
+        )
+    return stats
+
+
+async def tariff_data(hass: HomeAssistant, resource) -> dict | None:
     """Get tariff data from the API."""
     try:
         tariff = await hass.async_add_executor_job(resource.get_tariff)
-        _LOGGER.debug(
-            "Successful GET to https://api.glowmarkt.com/api/v0-1/resource/%s/tariff",
-            resource.id,
-        )
+        _LOGGER.debug("Successful GET for tariff data of resource %s", resource.id)
         return tariff
-    except UnboundLocalError:
-        supply = supply_type(resource)
-        _LOGGER.warning(
-            "No tariff data found for %s meter (id: %s). If you don't see tariff data for this meter in the Bright app, please disable the associated rate and standing charge sensors",
-            supply,
-            resource.id,
-        )
     except requests.Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
+        _LOGGER.error(
+            "Timeout retrieving tariff data for resource %s: %s", resource.id, ex
+        )
     except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.error(
+            "Cannot connect retrieving tariff data for resource %s: %s", resource.id, ex
+        )
+    except Exception as ex:
         if "Request failed" in str(ex):
             _LOGGER.warning(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
+                "Non-200 Status Code when fetching tariff data for resource %s",
+                resource.id,
             )
         else:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+            _LOGGER.exception(
+                "Unexpected exception retrieving tariff data for resource %s: %s",
+                resource.id,
+                ex,
+            )
     return None
 
 
-class HistoricalSensorMixin(PollUpdateMixin, HistoricalSensor, SensorEntity):
-    @property
-    def statistic_id(self) -> str:
-        return self.entity_id
+class HistoricalUsageSensor(SensorEntity):
+    """Sensor for hourly consumption (usage) data."""
 
-    def get_statistic_metadata(self) -> StatisticMetaData:
-        meta = super().get_statistic_metadata()
-        meta["has_sum"] = True
-        return meta
-
-    async def async_calculate_statistic_data(
-        self, hist_states: list[HistoricalState], *, latest: dict | None = None
-    ) -> list[StatisticData]:
-        accumulated = latest["sum"] if latest else 0
-
-        def hour_block_for_hist_state(hist_state: HistoricalState) -> datetime:
-            if hist_state.dt.minute == 0 and hist_state.dt.second == 0:
-                dt = hist_state.dt - timedelta(hours=1)
-                return dt.replace(minute=0, second=0, microsecond=0)
-            else:
-                return hist_state.dt.replace(minute=0, second=0, microsecond=0)
-
-        ret = []
-        for dt, collection_it in itertools.groupby(
-            hist_states, key=hour_block_for_hist_state
-        ):
-            collection = list(collection_it)
-            mean = statistics.mean([x.state for x in collection])
-            partial_sum = sum([x.state for x in collection])
-            accumulated += partial_sum
-
-            ret.append(
-                StatisticData(
-                    start=dt,
-                    state=partial_sum,
-                    mean=mean,
-                    sum=accumulated,
-                )
-            )
-        return ret
-
-
-class HistoricalUsage(HistoricalSensorMixin):
-    """Historical sensor object for daily usage."""
-
+    _attr_state_class = "measurement"
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_has_entity_name = True
-    _attr_name = "Historical Usage"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
 
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
-        """Initialize the sensor."""
-        self._attr_unique_id = f"{resource.id}-historical-usage"
+    def __init__(self, hass: HomeAssistant, virtual_entity, resource) -> None:
+        """Initialize the consumption sensor."""
         self.hass = hass
-        self.initialised = False
-        self.resource = resource
-        self.virtual_entity = virtual_entity
-        self.UPDATE_INTERVAL = SCAN_INTERVAL
+        self._virtual_entity = virtual_entity
+        self._resource = resource
+        supply = supply_type(resource)
+        self._attr_unique_id = f"{supply}_consumption_{resource.id}"
+        self._attr_name = (
+            f"{virtual_entity.name} {supply.capitalize()} Consumption"
+            if virtual_entity.name
+            else f"{supply.capitalize()} Consumption"
+        )
+        self._state: float | None = None
+        self._initialized = False
+        self._attr_should_poll = False
 
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
+    @property
+    def state(self) -> float | None:
+        """Return the most recent consumption value."""
+        return self._state
+
+    @property
+    def icon(self) -> str | None:
+        """Icon to use in the frontend."""
+        # Only the gas usage sensor needs an icon as the others inherit from their device class
+        if self._resource.classifier == "gas.consumption":
+            return "mdi:fire"
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Return device information."""
+        """Return device information for the consumption sensor."""
         return DeviceInfo(
-            identifiers={(DOMAIN, self.resource.id)},
+            identifiers={(DOMAIN, self._resource.id)},
             manufacturer="Hildebrand",
             model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
+            name=device_name(self._resource, self._virtual_entity),
         )
 
-    async def async_update_historical(self) -> None:
-        """Fetch new data for the sensor."""
-        if not self.initialised or await should_update():
-            t_from = None
-            if not self.initialised:
-                t_from = await self.hass.async_add_executor_job(
-                    self.resource.round, datetime.now() - timedelta(days=30), "P1D"
-                )
-            readings = await daily_data(self.hass, self.resource, t_from)
-            self.initialised = True
-            hist_states = []
-            for reading in readings:
-                hist_states.append(
-                    HistoricalState(  # noqa: PERF401
-                        state=reading[1].value,
-                        dt=dt_util.as_local(reading[0] + timedelta(minutes=1)),
-                    )
-                )
-            self._attr_historical_states = hist_states
+    @callback
+    async def async_update_callback(self) -> None:
+        """Callback triggered by time change to update the sensor and inject statistics."""
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def async_update(self) -> None:
+        """Fetch hourly consumption data and update sensor state and statistics."""
+        t_from = None
+        if not self._initialized:
+            t_from = await self.hass.async_add_executor_job(
+                self._resource.round, datetime.now() - timedelta(days=30), "P1D"
+            )
+        readings = await daily_data(self.hass, self._resource, t_from)
+        if readings:
+            stats = _generate_statistics_from_readings(readings)
+            self._state = round(readings[-1][1].value, 2)
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                name=(
+                    f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Consumption"
+                    if self._virtual_entity.name
+                    else f"{supply_type(self._resource).capitalize()} Consumption"
+                ),
+                source=DOMAIN,
+                statistic_id=f"{DOMAIN}:{supply_type(self._resource)}_consumption",
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            )
+            async_add_external_statistics(self.hass, metadata, stats)
+            self._initialized = True
+        else:
+            self._state = None
 
 
-class HistoricalCost(HistoricalSensorMixin):
-    """Historical sensor object for daily cost."""
+class HistoricalCostSensor(SensorEntity):
+    """Sensor for hourly cost data."""
 
-    _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_has_entity_name = True
-    _attr_name = "Historical Cost"
+    _attr_state_class = "measurement"
     _attr_native_unit_of_measurement = "GBP"
+    _attr_device_class = SensorDeviceClass.MONETARY
 
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
-        """Initialize the sensor."""
-        self._attr_unique_id = f"{resource.id}-historical-cost"
+    def __init__(self, hass: HomeAssistant, virtual_entity, resource) -> None:
+        """Initialize the cost sensor."""
         self.hass = hass
-        self.initialised = False
-        self.meter = None
-        self.resource = resource
-        self.virtual_entity = virtual_entity
-        self.UPDATE_INTERVAL = SCAN_INTERVAL
+        self._virtual_entity = virtual_entity
+        self._resource = resource
+        supply = supply_type(resource)
+        self._attr_unique_id = f"{supply}_cost_{resource.id}"
+        self._attr_name = (
+            f"{virtual_entity.name} {supply.capitalize()} Cost"
+            if virtual_entity.name
+            else f"{supply.capitalize()} Cost"
+        )
+        self._state: float | None = None
+        self._initialized = False
+        self.meter: SensorEntity | None = None
+        self._attr_should_poll = False
 
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
+    @property
+    def state(self) -> float | None:
+        """Return the most recent cost value in GBP."""
+        return self._state
+
+    @property
+    def icon(self) -> str | None:
+        """Icon to use in the frontend."""
+        # Only the gas usage sensor needs an icon as the others inherit from their device class
+        return "mdi:cash"
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Return device information."""
+        """Return device information for the cost sensor."""
+        identifier = self.meter._resource.id if self.meter else self._resource.id
         return DeviceInfo(
-            identifiers={(DOMAIN, self.meter.resource.id)},
+            identifiers={(DOMAIN, identifier)},
             manufacturer="Hildebrand",
             model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
+            name=device_name(self._resource, self._virtual_entity),
         )
 
-    async def async_update_historical(self) -> None:
-        """Fetch new data for the sensor."""
-        # Get data on initial startup
-        if not self.initialised or await should_update():
-            t_from = None
-            if not self.initialised:
-                t_from = await self.hass.async_add_executor_job(
-                    self.resource.round, datetime.now() - timedelta(days=30), "P1D"
-                )
-            readings = await daily_data(self.hass, self.resource, t_from)
-            self.initialised = True
-            hist_states = []
-            for reading in readings:
-                hist_states.append(
-                    HistoricalState(  # noqa: PERF401
-                        state=reading[1].value / 100,
-                        dt=dt_util.as_local(reading[0] + timedelta(minutes=1)),
-                    )
-                )
-            self._attr_historical_states = hist_states
+    @callback
+    async def async_update_callback(self) -> None:
+        """Callback triggered by time change to update the sensor and inject statistics."""
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def async_update(self) -> None:
+        """Fetch hourly cost data and update sensor state and statistics."""
+        t_from = None
+        if not self._initialized:
+            t_from = await self.hass.async_add_executor_job(
+                self._resource.round, datetime.now() - timedelta(days=30), "P1D"
+            )
+        readings = await daily_data(self.hass, self._resource, t_from)
+        if readings:
+            stats = _generate_statistics_from_readings(readings, True)
+            self._state = round(readings[-1][1].value, 2)
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                name=(
+                    f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Cost"
+                    if self._virtual_entity.name
+                    else f"{supply_type(self._resource).capitalize()} Cost"
+                ),
+                source=DOMAIN,
+                statistic_id=f"{DOMAIN}:{supply_type(self._resource)}_cost",
+                unit_of_measurement="GBP",
+            )
+            async_add_external_statistics(self.hass, metadata, stats)
+            self._initialized = True
+        else:
+            self._state = None
 
 
 class TariffCoordinator(DataUpdateCoordinator):
-    """Data update coordinator for the tariff sensors."""
+    """Data update coordinator for tariff sensors."""
 
     def __init__(self, hass: HomeAssistant, resource) -> None:
-        """Initialize tariff coordinator."""
+        """Initialize the tariff coordinator."""
         super().__init__(
             hass,
             _LOGGER,
+            # Name of the data. For logging purposes.
             name="tariff",
-            update_interval=SCAN_INTERVAL,
+            # Polling interval. Will only be polled if there are subscribers.
+            update_interval=None,
         )
 
-        self.rate_initialised = False
-        self.standing_initialised = False
-        self.resource = resource
+        self._resource = resource
 
     async def _async_update_data(self):
         """Fetch data from tariff API endpoint."""
-        if not self.standing_initialised or not self.rate_initialised:
-            self.standing_initialised = True
-            self.rate_initialised = True
-            return await tariff_data(self.hass, self.resource)
-        if await should_update():
-            return await tariff_data(self.hass, self.resource)
+        return await tariff_data(self.hass, self._resource)
 
 
 class Standing(CoordinatorEntity, SensorEntity):
-    """An entity using CoordinatorEntity."""
+    """An entity using CoordinatorEntity.
+
+    The CoordinatorEntity class provides:
+      should_poll
+      async_update
+      async_added_to_hass
+      available
+
+    """
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_has_entity_name = True
     _attr_name = "Standing charge"
     _attr_native_unit_of_measurement = "GBP"
-    _attr_entity_registry_enabled_default = False
+    _attr_entity_registry_enabled_default = (
+        False  # Don't enable by default as less commonly used
+    )
 
     def __init__(self, coordinator, resource, virtual_entity) -> None:
         """Pass coordinator to CoordinatorEntity."""
@@ -426,8 +481,8 @@ class Standing(CoordinatorEntity, SensorEntity):
 
         self._attr_unique_id = resource.id + "-tariff"
 
-        self.resource = resource
-        self.virtual_entity = virtual_entity
+        self._resource = resource
+        self._virtual_entity = virtual_entity
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -443,22 +498,34 @@ class Standing(CoordinatorEntity, SensorEntity):
     def device_info(self) -> DeviceInfo:
         """Return device information."""
         return DeviceInfo(
-            identifiers={(DOMAIN, self.resource.id)},
+            identifiers={(DOMAIN, self._resource.id)},
             manufacturer="Hildebrand",
             model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
+            name=device_name(self._resource, self._virtual_entity),
         )
 
 
 class Rate(CoordinatorEntity, SensorEntity):
-    """An entity using CoordinatorEntity."""
+    """An entity using CoordinatorEntity.
+
+    The CoordinatorEntity class provides:
+      should_poll
+      async_update
+      async_added_to_hass
+      available
+
+    """
 
     _attr_device_class = None
     _attr_has_entity_name = True
-    _attr_icon = "mdi:cash-multiple"
+    _attr_icon = (
+        "mdi:cash-multiple"  # Need to provide an icon as doesn't have a device class
+    )
     _attr_name = "Rate"
     _attr_native_unit_of_measurement = "GBP/kWh"
-    _attr_entity_registry_enabled_default = False
+    _attr_entity_registry_enabled_default = (
+        False  # Don't enable by default as less commonly used
+    )
 
     def __init__(self, coordinator, resource, virtual_entity) -> None:
         """Pass coordinator to CoordinatorEntity."""
@@ -466,8 +533,8 @@ class Rate(CoordinatorEntity, SensorEntity):
 
         self._attr_unique_id = resource.id + "-rate"
 
-        self.resource = resource
-        self.virtual_entity = virtual_entity
+        self._resource = resource
+        self._virtual_entity = virtual_entity
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -481,8 +548,8 @@ class Rate(CoordinatorEntity, SensorEntity):
     def device_info(self) -> DeviceInfo:
         """Return device information."""
         return DeviceInfo(
-            identifiers={(DOMAIN, self.resource.id)},
+            identifiers={(DOMAIN, self._resource.id)},
             manufacturer="Hildebrand",
             model="Glow (DCC)",
-            name=device_name(self.resource, self.virtual_entity),
+            name=device_name(self._resource, self._virtual_entity),
         )
