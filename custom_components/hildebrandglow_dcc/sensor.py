@@ -25,6 +25,8 @@ from homeassistant.helpers.event import async_track_time_change
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+UPDATE_MINUTES = [1, 31]
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: Callable
@@ -88,7 +90,7 @@ async def async_setup_entry(
                 async_track_time_change(
                     hass,
                     usage_sensor.async_update_callback,
-                    minute=[1, 31],
+                    minute=UPDATE_MINUTES,
                     second=0,
                 )
 
@@ -101,7 +103,7 @@ async def async_setup_entry(
                 async_track_time_change(
                     hass,
                     lambda now: coordinator.async_request_refresh(),
-                    minute=[1, 31],
+                    minute=UPDATE_MINUTES,
                     second=0,
                 )
 
@@ -115,7 +117,7 @@ async def async_setup_entry(
                 async_track_time_change(
                     hass,
                     cost_sensor.async_update_callback,
-                    minute=[1, 31],
+                    minute=UPDATE_MINUTES,
                     second=0,
                 )
             elif resource.classifier == "electricity.consumption.cost":
@@ -126,7 +128,7 @@ async def async_setup_entry(
                 async_track_time_change(
                     hass,
                     cost_sensor.async_update_callback,
-                    minute=[1, 31],
+                    minute=UPDATE_MINUTES,
                     second=0,
                 )
 
@@ -320,7 +322,7 @@ class HistoricalUsageSensor(SensorEntity):
         )
 
     @callback
-    async def async_update_callback(self) -> None:
+    async def async_update_callback(self, ts) -> None:
         """Callback triggered by time change to update the sensor and inject statistics."""
         await self.async_update()
         self.async_write_ha_state()
@@ -401,7 +403,7 @@ class HistoricalCostSensor(SensorEntity):
         )
 
     @callback
-    async def async_update_callback(self) -> None:
+    async def async_update_callback(self, ts) -> None:
         """Callback triggered by time change to update the sensor and inject statistics."""
         await self.async_update()
         self.async_write_ha_state()
