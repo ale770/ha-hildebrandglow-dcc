@@ -5,22 +5,31 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import logging
+from operator import itemgetter
 
 import requests
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.components.recorder.statistics import async_add_external_statistics
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
 )
 from homeassistant.util import dt as dt_util
-from homeassistant.helpers.event import async_track_time_change
 
 from .const import DOMAIN
 
@@ -102,7 +111,7 @@ async def async_setup_entry(
 
                 async_track_time_change(
                     hass,
-                    lambda now: coordinator.async_request_refresh(),
+                    coordinator.async_update_callback,
                     minute=UPDATE_MINUTES,
                     second=0,
                 )
@@ -154,19 +163,13 @@ def device_name(resource, virtual_entity) -> str:
     return f"Smart {supply.capitalize()} Meter"
 
 
-async def should_update() -> bool:
-    """Return True if current minute is between 1-5 or 31-35, indicating an update window."""
-    minutes = datetime.now().minute
-    return (1 <= minutes <= 5) or (31 <= minutes <= 35)
-
-
 async def daily_data(
     hass: HomeAssistant, resource, t_from: datetime = None
 ) -> list[tuple[datetime, float]] | None:
     """Return hourly readings for a daily period from the API."""
     if t_from is None:
         t_from = await hass.async_add_executor_job(
-            resource.round, datetime.now() - timedelta(hours=12), "P1D"
+            resource.round, datetime.now() - timedelta(hours=24), "P1D"
         )
 
     t_to = await hass.async_add_executor_job(
@@ -226,12 +229,14 @@ async def daily_data(
 def _generate_statistics_from_readings(
     readings: list[tuple[datetime, float]],
     isPence: bool = False,
+    cumulative_start: float = 0.0,
 ) -> list[StatisticData]:
-    """Convert a list of (datetime, value) readings into StatisticData entries."""
+    """Convert a list of (datetime, reading) entries into StatisticData entries."""
     sorted_readings = sorted(readings, key=lambda x: x[0])
-    cumulative = 0.0
+    cumulative = cumulative_start
     stats: list[StatisticData] = []
     for dt_obj, elem in sorted_readings:
+        # Normalize the start timestamp to the hour
         hour_ts = dt_obj.replace(minute=0, second=0, microsecond=0)
         value = elem.value
         if isPence:
@@ -245,6 +250,16 @@ def _generate_statistics_from_readings(
             )
         )
     return stats
+
+
+def _discard_after_last_non_zero_reading(readings):
+    # Iterate through the readings in reverse order
+    for i in range(len(readings) - 1, -1, -1):
+        if readings[i][1].value != 0:
+            # Slice the list to exclude the last non-zero reading
+            return readings[:i]
+    # If all readings are zero, return an empty list
+    return []
 
 
 async def tariff_data(hass: HomeAssistant, resource) -> dict | None:
@@ -279,7 +294,7 @@ async def tariff_data(hass: HomeAssistant, resource) -> dict | None:
 class HistoricalUsageSensor(SensorEntity):
     """Sensor for hourly consumption (usage) data."""
 
-    _attr_state_class = "measurement"
+    _attr_state_class = SensorStateClass.TOTAL
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
 
@@ -296,7 +311,6 @@ class HistoricalUsageSensor(SensorEntity):
             else f"{supply.capitalize()} Consumption"
         )
         self._state: float | None = None
-        self._initialized = False
         self._attr_should_poll = False
 
     @property
@@ -307,7 +321,7 @@ class HistoricalUsageSensor(SensorEntity):
     @property
     def icon(self) -> str | None:
         """Icon to use in the frontend."""
-        # Only the gas usage sensor needs an icon as the others inherit from their device class
+        # Only the gas usage sensor needs an icon as the others inherit from their device class.
         if self._resource.classifier == "gas.consumption":
             return "mdi:fire"
 
@@ -330,36 +344,68 @@ class HistoricalUsageSensor(SensorEntity):
     async def async_update(self) -> None:
         """Fetch hourly consumption data and update sensor state and statistics."""
         t_from = None
-        if not self._initialized:
+        stat_id = f"{DOMAIN}:{supply_type(self._resource)}_consumption"
+
+        try:
+            # Look up the most recent statistics data. This lookup runs in the executor.
+            last_stats = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, stat_id, True, {"sum"}
+            )
+            # If a previous value exists, use its "sum" as the starting cumulative.
+            if len(last_stats.get(stat_id, [])) > 0:
+                last_stats = last_stats[stat_id]
+                last_stats = sorted(last_stats, key=itemgetter("start"), reverse=False)[
+                    0
+                ]
+
+        except AttributeError:
+            last_stats = None
+        if not last_stats:
+            # First time lets insert last 30 days of data
             t_from = await self.hass.async_add_executor_job(
                 self._resource.round, datetime.now() - timedelta(days=30), "P1D"
             )
+
         readings = await daily_data(self.hass, self._resource, t_from)
-        if readings:
-            stats = _generate_statistics_from_readings(readings)
-            self._state = round(readings[-1][1].value, 2)
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                name=(
-                    f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Consumption"
-                    if self._virtual_entity.name
-                    else f"{supply_type(self._resource).capitalize()} Consumption"
-                ),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:{supply_type(self._resource)}_consumption",
-                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            )
-            async_add_external_statistics(self.hass, metadata, stats)
-            self._initialized = True
+        readings = _discard_after_last_non_zero_reading(readings)
+
+        if last_stats is not None and last_stats.get("sum") is not None:
+            initial_cumulative = last_stats["sum"]
+            # Discard all readings before last_stats["start"].
+            start_ts = dt_util.as_utc(datetime.fromtimestamp(last_stats.get("start")))
+            readings = [r for r in readings if r[0] > start_ts]
         else:
-            self._state = None
+            initial_cumulative = 0.0
+
+        if len(readings) == 0:
+            return
+
+        # Generate new StatisticData entries using the previous cumulative sum.
+        stats = _generate_statistics_from_readings(
+            readings, cumulative_start=initial_cumulative
+        )
+        self._state = round(readings[-1][1].value, 2)
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=(
+                f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Consumption"
+                if self._virtual_entity.name
+                else f"{supply_type(self._resource).capitalize()} Consumption"
+            ),
+            source=DOMAIN,
+            statistic_id=stat_id,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
+        # Register the new statistics with Home Assistant.
+        async_add_external_statistics(self.hass, metadata, stats)
 
 
 class HistoricalCostSensor(SensorEntity):
     """Sensor for hourly cost data."""
 
-    _attr_state_class = "measurement"
+    _attr_state_class = SensorStateClass.TOTAL
     _attr_native_unit_of_measurement = "GBP"
     _attr_device_class = SensorDeviceClass.MONETARY
 
@@ -376,7 +422,6 @@ class HistoricalCostSensor(SensorEntity):
             else f"{supply.capitalize()} Cost"
         )
         self._state: float | None = None
-        self._initialized = False
         self.meter: SensorEntity | None = None
         self._attr_should_poll = False
 
@@ -411,30 +456,62 @@ class HistoricalCostSensor(SensorEntity):
     async def async_update(self) -> None:
         """Fetch hourly cost data and update sensor state and statistics."""
         t_from = None
-        if not self._initialized:
+        stat_id = f"{DOMAIN}:{supply_type(self._resource)}_cost"
+
+        try:
+            # Look up the most recent statistics data. This lookup runs in the executor.
+            last_stats = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, stat_id, True, {"sum"}
+            )
+            # If a previous value exists, use its "sum" as the starting cumulative.
+            if len(last_stats.get(stat_id, [])) > 0:
+                last_stats = last_stats[stat_id]
+                last_stats = sorted(last_stats, key=itemgetter("start"), reverse=False)[
+                    0
+                ]
+
+        except AttributeError:
+            last_stats = None
+        if not last_stats:
+            # First time lets insert last 30 days of data
             t_from = await self.hass.async_add_executor_job(
                 self._resource.round, datetime.now() - timedelta(days=30), "P1D"
             )
+
         readings = await daily_data(self.hass, self._resource, t_from)
-        if readings:
-            stats = _generate_statistics_from_readings(readings, True)
-            self._state = round(readings[-1][1].value, 2)
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                name=(
-                    f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Cost"
-                    if self._virtual_entity.name
-                    else f"{supply_type(self._resource).capitalize()} Cost"
-                ),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:{supply_type(self._resource)}_cost",
-                unit_of_measurement="GBP",
-            )
-            async_add_external_statistics(self.hass, metadata, stats)
-            self._initialized = True
+        readings = _discard_after_last_non_zero_reading(readings)
+
+        if last_stats is not None and last_stats.get("sum") is not None:
+            initial_cumulative = last_stats["sum"]
+            # Discard all readings before last_stats["start"].
+            start_ts = dt_util.as_utc(datetime.fromtimestamp(last_stats.get("start")))
+            readings = [r for r in readings if r[0] > start_ts]
         else:
-            self._state = None
+            initial_cumulative = 0.0
+
+        if len(readings) == 0:
+            return
+
+        # Generate new StatisticData entries using the previous cumulative sum.
+        stats = _generate_statistics_from_readings(
+            readings, cumulative_start=initial_cumulative, isPence=True
+        )
+        self._state = round(readings[-1][1].value, 2)
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=(
+                f"{self._virtual_entity.name} {supply_type(self._resource).capitalize()} Cost"
+                if self._virtual_entity.name
+                else f"{supply_type(self._resource).capitalize()} Cost"
+            ),
+            source=DOMAIN,
+            statistic_id=stat_id,
+            unit_of_measurement="GBP",
+        )
+        # Register the new statistics with Home Assistant.
+        async_add_external_statistics(self.hass, metadata, stats)
 
 
 class TariffCoordinator(DataUpdateCoordinator):
@@ -452,6 +529,11 @@ class TariffCoordinator(DataUpdateCoordinator):
         )
 
         self._resource = resource
+
+    @callback
+    async def async_update_callback(self, ts) -> None:
+        """Callback triggered by time change to update the sensor and inject statistics."""
+        await self.async_request_refresh()
 
     async def _async_update_data(self):
         """Fetch data from tariff API endpoint."""
