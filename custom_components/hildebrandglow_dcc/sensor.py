@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import logging
 from operator import itemgetter
+from gql import gql, Client
+from gql.transport.aiohttp import AIOHTTPTransport
 
 import requests
 
@@ -33,8 +35,46 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 
+gql_transport = None
+gql_client = None
+
+token_query = """mutation {{
+	obtainKrakenToken(input: {{ APIKey: "{api_key}" }}) {{
+	    token
+	}}
+}}"""
+
+account_query = """query{{
+    account(
+        accountNumber: "{acc_number}"
+    ) {{
+    electricityAgreements(active: true) {{
+        validFrom
+        validTo
+        meterPoint {{
+            meters(includeInactive: false) {{
+                smartDevices {{
+                    deviceId
+                }}
+            }}
+            mpan
+        }}
+        tariff {{
+            ... on HalfHourlyTariff {{
+                id
+                productCode
+                tariffCode
+                productCode
+                standingCharge
+                }}
+            }}
+        }}
+    }}
+}}"""
+
 _LOGGER = logging.getLogger(__name__)
 UPDATE_MINUTES = [1, 31]
+BASE_URL = "https://api.octopus.energy/v1"
 
 
 async def async_setup_entry(
@@ -46,6 +86,8 @@ async def async_setup_entry(
 
     # Get API object from the config flow.
     glowmarkt = hass.data[DOMAIN][entry.entry_id]
+    api_key = entry.data["api_key"]
+    account_number = entry.data["account_number"]
 
     # Gather all virtual entities on the account
     virtual_entities: dict = {}
@@ -91,7 +133,9 @@ async def async_setup_entry(
         # Loop through all resources and create sensors
         for resource in resources:
             if resource.classifier in ["electricity.consumption", "gas.consumption"]:
-                usage_sensor = HistoricalUsageSensor(hass, virtual_entity, resource)
+                usage_sensor = HistoricalUsageSensor(
+                    hass, virtual_entity, resource, api_key, account_number
+                )
                 entities.append(usage_sensor)
                 meters[resource.classifier] = usage_sensor
 
@@ -112,31 +156,6 @@ async def async_setup_entry(
                 async_track_time_change(
                     hass,
                     coordinator.async_update_callback,
-                    minute=UPDATE_MINUTES,
-                    second=0,
-                )
-
-        # Cost sensors must be created after usage sensors as they reference them as a meter
-        for resource in resources:
-            if resource.classifier == "gas.consumption.cost":
-                cost_sensor = HistoricalCostSensor(hass, virtual_entity, resource)
-                cost_sensor.meter = meters.get("gas.consumption")
-                entities.append(cost_sensor)
-
-                async_track_time_change(
-                    hass,
-                    cost_sensor.async_update_callback,
-                    minute=UPDATE_MINUTES,
-                    second=0,
-                )
-            elif resource.classifier == "electricity.consumption.cost":
-                cost_sensor = HistoricalCostSensor(hass, virtual_entity, resource)
-                cost_sensor.meter = meters.get("electricity.consumption")
-                entities.append(cost_sensor)
-
-                async_track_time_change(
-                    hass,
-                    cost_sensor.async_update_callback,
                     minute=UPDATE_MINUTES,
                     second=0,
                 )
@@ -167,10 +186,6 @@ async def daily_data(
     hass: HomeAssistant, resource, t_from: datetime = None
 ) -> list[tuple[datetime, float]] | None:
     """Return hourly readings for a daily period from the API."""
-    if t_from is None:
-        t_from = await hass.async_add_executor_job(
-            resource.round, datetime.now() - timedelta(hours=24), "P1D"
-        )
 
     t_to = await hass.async_add_executor_job(
         resource.round,
@@ -228,8 +243,8 @@ async def daily_data(
 
 def _generate_statistics_from_readings(
     readings: list[tuple[datetime, float]],
-    isPence: bool = False,
     cumulative_start: float = 0.0,
+    unit_rates: list[dict] = None,
 ) -> list[StatisticData]:
     """Convert a list of (datetime, reading) entries into StatisticData entries."""
     sorted_readings = sorted(readings, key=lambda x: x[0])
@@ -238,9 +253,18 @@ def _generate_statistics_from_readings(
     for dt_obj, elem in sorted_readings:
         # Normalize the start timestamp to the hour
         hour_ts = dt_obj.replace(minute=0, second=0, microsecond=0)
+        # convert to timestamp
+        read_time = hour_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
         value = elem.value
-        if isPence:
-            value = elem.value / 100
+        if unit_rates is not None:
+            # Find the unit rate that applies to this hour
+            matching_rate = next(
+                rate
+                for rate in unit_rates
+                if rate["valid_from"] < read_time <= rate["valid_to"]
+            )
+            cost = float("{:.4f}".format(value * matching_rate["value_inc_vat"]))
+            value = cost / 100
         cumulative += value
         stats.append(
             StatisticData(
@@ -291,6 +315,78 @@ async def tariff_data(hass: HomeAssistant, resource) -> dict | None:
     return None
 
 
+def setup_gql(token):
+    global gql_transport, gql_client
+    gql_transport = AIOHTTPTransport(
+        url=f"{BASE_URL}/graphql/", headers={"Authorization": f"{token}"}
+    )
+    gql_client = Client(transport=gql_transport, fetch_schema_from_transport=True)
+
+
+def get_token(api_key):
+    transport = AIOHTTPTransport(url=f"{BASE_URL}/graphql/")
+    client = Client(transport=transport, fetch_schema_from_transport=True)
+    query = gql(token_query.format(api_key=api_key))
+    result = client.execute(query)
+    return result["obtainKrakenToken"]["token"]
+
+
+def get_acc_info(account_number):
+    query = gql(account_query.format(acc_number=account_number))
+    result = gql_client.execute(query)
+    tariff_code = next(
+        agreement["tariff"]["tariffCode"]
+        for agreement in result["account"]["electricityAgreements"]
+        if "tariffCode" in agreement["tariff"]
+    )
+    region_code = tariff_code[-1]
+
+    if "GO" in tariff_code:
+        current_tariff = "GO"
+    elif "AGILE" in tariff_code:
+        current_tariff = "AGILE"
+    else:
+        raise Exception(f"ERROR: Unknown tariff code: {tariff_code}")
+
+    return current_tariff, region_code
+
+
+def rest_query(url):
+    response = requests.get(url)
+    if response.ok:
+        data = response.json()
+        return data
+    else:
+        raise Exception(
+            f"ERROR: rest_query failed querying `{url}` with {response.status_code}"
+        )
+
+
+def get_potential_tariff_rates(tariff, region_code, lookup_date_from):
+    all_products = rest_query(f"{BASE_URL}/products")
+    tariff_code = next(
+        product["code"]
+        for product in all_products["results"]
+        if product["display_name"]
+        == ("Agile Octopus" if tariff == "AGILE" else "Octopus Go")
+        and product["direction"] == "IMPORT"
+        and product["brand"] == "OCTOPUS_ENERGY"
+    )
+    # Residential tariffs are always E-1R (i think, lol)
+    product_code = f"E-1R-{tariff_code}-{region_code}"
+    # substract 1 day from lookup_date_from
+    lookup_date_from = lookup_date_from - timedelta(days=1)
+
+    unit_rates = []
+    while lookup_date_from.date() <= date.today():
+        unit_rates += rest_query(
+            f"{BASE_URL}/products/{tariff_code}/electricity-tariffs/{product_code}/standard-unit-rates/?period_from={lookup_date_from.year}-{lookup_date_from.month}-{lookup_date_from.day}T00:00:00Z&period_to={lookup_date_from.year}-{lookup_date_from.month}-{lookup_date_from.day}T23:59:59Z"
+        )["results"]
+        lookup_date_from += timedelta(days=1)
+
+    return unit_rates
+
+
 class HistoricalUsageSensor(SensorEntity):
     """Sensor for hourly consumption (usage) data."""
 
@@ -298,11 +394,15 @@ class HistoricalUsageSensor(SensorEntity):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
 
-    def __init__(self, hass: HomeAssistant, virtual_entity, resource) -> None:
+    def __init__(
+        self, hass: HomeAssistant, virtual_entity, resource, api_key, account_number
+    ) -> None:
         """Initialize the consumption sensor."""
         self.hass = hass
         self._virtual_entity = virtual_entity
         self._resource = resource
+        self._api_key = api_key
+        self._account_number = account_number
         supply = supply_type(resource)
         self._attr_unique_id = f"{supply}_consumption_{resource.id}"
         self._attr_name = (
@@ -345,6 +445,7 @@ class HistoricalUsageSensor(SensorEntity):
         """Fetch hourly consumption data and update sensor state and statistics."""
         t_from = None
         stat_id = f"{DOMAIN}:{supply_type(self._resource)}_consumption"
+        cost_stat_id = f"{DOMAIN}:{supply_type(self._resource)}_cost"
 
         try:
             # Look up the most recent statistics data. This lookup runs in the executor.
@@ -358,12 +459,28 @@ class HistoricalUsageSensor(SensorEntity):
                     0
                 ]
 
+            # Look up the most recent statistics data. This lookup runs in the executor.
+            cost_last_stats = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, cost_stat_id, True, {"sum"}
+            )
+            # If a previous value exists, use its "sum" as the starting cumulative.
+            if len(cost_last_stats.get(cost_stat_id, [])) > 0:
+                cost_last_stats = cost_last_stats[cost_stat_id]
+                cost_last_stats = sorted(
+                    cost_last_stats, key=itemgetter("start"), reverse=False
+                )[0]
         except AttributeError:
             last_stats = None
+            cost_last_stats = None
         if not last_stats:
             # First time lets insert last 30 days of data
             t_from = await self.hass.async_add_executor_job(
                 self._resource.round, datetime.now() - timedelta(days=30), "P1D"
+            )
+
+        if t_from is None:
+            t_from = await self.hass.async_add_executor_job(
+                self._resource.round, datetime.now() - timedelta(hours=24), "P1D"
             )
 
         readings = await daily_data(self.hass, self._resource, t_from)
@@ -377,12 +494,36 @@ class HistoricalUsageSensor(SensorEntity):
         else:
             initial_cumulative = 0.0
 
+        if cost_last_stats is not None and cost_last_stats.get("sum") is not None:
+            cost_initial_cumulative = cost_last_stats["sum"]
+            # Discard all readings before cost_last_stats["start"].
+            start_ts = dt_util.as_utc(
+                datetime.fromtimestamp(cost_last_stats.get("start"))
+            )
+        else:
+            cost_initial_cumulative = 0.0
+
         if len(readings) == 0:
             return
+
+        token = await get_instance(self.hass).async_add_executor_job(
+            get_token, self._api_key
+        )
+        await get_instance(self.hass).async_add_executor_job(setup_gql, token)
+        (curr_tariff, region_code) = await get_instance(
+            self.hass
+        ).async_add_executor_job(get_acc_info, self._account_number)
+        (unit_rates) = await get_instance(self.hass).async_add_executor_job(
+            get_potential_tariff_rates, curr_tariff, region_code, t_from
+        )
 
         # Generate new StatisticData entries using the previous cumulative sum.
         stats = _generate_statistics_from_readings(
             readings, cumulative_start=initial_cumulative
+        )
+
+        cost_stats = _generate_statistics_from_readings(
+            readings, cumulative_start=cost_initial_cumulative, unit_rates=unit_rates
         )
         self._state = round(readings[-1][1].value, 2)
 
@@ -398,107 +539,8 @@ class HistoricalUsageSensor(SensorEntity):
             statistic_id=stat_id,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
-        # Register the new statistics with Home Assistant.
-        async_add_external_statistics(self.hass, metadata, stats)
 
-
-class HistoricalCostSensor(SensorEntity):
-    """Sensor for hourly cost data."""
-
-    _attr_state_class = SensorStateClass.TOTAL
-    _attr_native_unit_of_measurement = "GBP"
-    _attr_device_class = SensorDeviceClass.MONETARY
-
-    def __init__(self, hass: HomeAssistant, virtual_entity, resource) -> None:
-        """Initialize the cost sensor."""
-        self.hass = hass
-        self._virtual_entity = virtual_entity
-        self._resource = resource
-        supply = supply_type(resource)
-        self._attr_unique_id = f"{supply}_cost_{resource.id}"
-        self._attr_name = (
-            f"{virtual_entity.name} {supply.capitalize()} Cost"
-            if virtual_entity.name
-            else f"{supply.capitalize()} Cost"
-        )
-        self._state: float | None = None
-        self.meter: SensorEntity | None = None
-        self._attr_should_poll = False
-
-    @property
-    def state(self) -> float | None:
-        """Return the most recent cost value in GBP."""
-        return self._state
-
-    @property
-    def icon(self) -> str | None:
-        """Icon to use in the frontend."""
-        # Only the gas usage sensor needs an icon as the others inherit from their device class
-        return "mdi:cash"
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information for the cost sensor."""
-        identifier = self.meter._resource.id if self.meter else self._resource.id
-        return DeviceInfo(
-            identifiers={(DOMAIN, identifier)},
-            manufacturer="Hildebrand",
-            model="Glow (DCC)",
-            name=device_name(self._resource, self._virtual_entity),
-        )
-
-    @callback
-    async def async_update_callback(self, ts) -> None:
-        """Callback triggered by time change to update the sensor and inject statistics."""
-        await self.async_update()
-        self.async_write_ha_state()
-
-    async def async_update(self) -> None:
-        """Fetch hourly cost data and update sensor state and statistics."""
-        t_from = None
-        stat_id = f"{DOMAIN}:{supply_type(self._resource)}_cost"
-
-        try:
-            # Look up the most recent statistics data. This lookup runs in the executor.
-            last_stats = await get_instance(self.hass).async_add_executor_job(
-                get_last_statistics, self.hass, 1, stat_id, True, {"sum"}
-            )
-            # If a previous value exists, use its "sum" as the starting cumulative.
-            if len(last_stats.get(stat_id, [])) > 0:
-                last_stats = last_stats[stat_id]
-                last_stats = sorted(last_stats, key=itemgetter("start"), reverse=False)[
-                    0
-                ]
-
-        except AttributeError:
-            last_stats = None
-        if not last_stats:
-            # First time lets insert last 30 days of data
-            t_from = await self.hass.async_add_executor_job(
-                self._resource.round, datetime.now() - timedelta(days=30), "P1D"
-            )
-
-        readings = await daily_data(self.hass, self._resource, t_from)
-        readings = _discard_after_last_non_zero_reading(readings)
-
-        if last_stats is not None and last_stats.get("sum") is not None:
-            initial_cumulative = last_stats["sum"]
-            # Discard all readings before last_stats["start"].
-            start_ts = dt_util.as_utc(datetime.fromtimestamp(last_stats.get("start")))
-            readings = [r for r in readings if r[0] > start_ts]
-        else:
-            initial_cumulative = 0.0
-
-        if len(readings) == 0:
-            return
-
-        # Generate new StatisticData entries using the previous cumulative sum.
-        stats = _generate_statistics_from_readings(
-            readings, cumulative_start=initial_cumulative, isPence=True
-        )
-        self._state = round(readings[-1][1].value, 2)
-
-        metadata = StatisticMetaData(
+        cost_metadata = StatisticMetaData(
             has_mean=False,
             has_sum=True,
             name=(
@@ -507,11 +549,12 @@ class HistoricalCostSensor(SensorEntity):
                 else f"{supply_type(self._resource).capitalize()} Cost"
             ),
             source=DOMAIN,
-            statistic_id=stat_id,
+            statistic_id=cost_stat_id,
             unit_of_measurement="GBP",
         )
         # Register the new statistics with Home Assistant.
         async_add_external_statistics(self.hass, metadata, stats)
+        async_add_external_statistics(self.hass, cost_metadata, cost_stats)
 
 
 class TariffCoordinator(DataUpdateCoordinator):
